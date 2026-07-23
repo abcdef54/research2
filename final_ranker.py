@@ -489,6 +489,17 @@ async def tournament_select(state: AgentState, config: RunnableConfig) -> dict:
         # Single candidate: nothing to select (no LLM call, no bracket).
         winner = pool[0]
         print(f"[IDX {idx}] Single candidate; no tournament needed.")
+    elif cfg.get("rank_mode") == "rank_no_reasoning":
+        print(f"[IDX {idx}] Executing One-Shot Ranker over all {len(pool)} candidates...")
+        rank_temp = cfg.get("rank_temperature", 0.0)
+        llm = get_llm(config, temperature=rank_temp)
+        t0 = time.perf_counter()
+        winner, rank_calls, rank_parse_failed = await rank_no_reasoning(
+            user_query, pool, llm, idx
+        )
+        rank_latency = time.perf_counter() - t0
+        tournament_rounds = 1
+        tournament_max_group_size = len(pool)
     else:
         rank_temp = cfg.get("rank_temperature", 0.0)   # greedy ranker by default -> reproducible
         llm = get_llm(config, temperature=rank_temp)
