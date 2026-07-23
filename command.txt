@@ -1,0 +1,1 @@
+docker run --rm --gpus all -p 18000:8080 -v D:\Work\Code\GithubProjects\LocalMind\src\backend\ai\llms\cpp_models:/models ghcr.io/ggml-org/llama.cpp:server-cuda -m /models/qwen2.5-3b-instruct-q4_k_m.gguf -ngl 99 -c 32784 --parallel 4
