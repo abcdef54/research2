@@ -1,5 +1,6 @@
 import os
 import re
+import math
 import time
 import random
 import asyncio
@@ -22,6 +23,13 @@ dotenv.load_dotenv()
 # candidate count grows and N=3 is the ranker's sweet spot, so each tournament round ranks groups
 # of 3 and byes the remainder (minimum rank calls).
 MAX_RANK_GROUP = 3
+
+# How many per-token alternatives to request from the server during GENERATION, used only by the
+# `self_certainty_proxy` selector. 20 is the OpenAI-compatible API's documented ceiling for
+# `top_logprobs`, so it is the most tail we can see through llama-server's /v1 endpoint. The exact
+# self-certainty of Kang et al. sums over the FULL vocabulary; we can only ever see the top slice
+# here, which is precisely why this metric is named a proxy (see `_self_certainty_proxy`).
+GEN_TOP_LOGPROBS = 20
 
 # ───────────────────────── LLM access ─────────────────────────
 
@@ -141,6 +149,10 @@ def _log_token_usage(idx: str, label: str, msg=None, prompt_text: str = "", comp
 class Candidate(BaseModel):
     id: str = Field(default_factory=lambda: uuid4().hex)  # stable identity for logging
     answer: str = ""
+    # Truncated self-certainty proxy computed from the generation call's top-k logprobs (see
+    # `_self_certainty_proxy`). None when the server returned no logprobs — the selector treats that
+    # as a hard error rather than guessing, so a misconfigured run can't masquerade as a valid one.
+    confidence: Optional[float] = None
 
 
 class AgentState(TypedDict):
@@ -206,6 +218,48 @@ def setup(state: AgentState, config: RunnableConfig) -> dict:
     }
 
 
+def _self_certainty_proxy(msg) -> Optional[float]:
+    """Mean per-token KL divergence from a uniform distribution, computed over the top-k
+    alternatives the server returned for each generated token. Higher = the model was more decisive
+    about its own tokens.
+
+    Per position i with the k returned alternatives renormalized to q (so they sum to 1):
+        KL(U_k || q) = -log k - (1/k) * sum_j log q_j
+    and the score is the mean over all positions.
+
+    WHY THIS IS A PROXY, NOT self-certainty: Kang et al. sum over the ENTIRE vocabulary (~150k for
+    Qwen). That sum is dominated by the low-probability tail, which no OpenAI-compatible endpoint
+    exposes (top_logprobs caps at 20). Truncating to the top-k therefore does NOT approximate their
+    number — it measures peakedness over the visible head instead. It is a legitimate confidence
+    signal and a legitimate baseline, but it must be reported under its own name; calling it
+    "self-certainty" would misattribute the formula. Getting the exact metric requires full logits,
+    i.e. running the model in-process (llama-cpp-python) rather than behind llama-server.
+
+    RETURNS: the score, or None when the response carried no usable logprobs (server not configured
+    for them) — callers must treat None as an error, never as a low score."""
+    rm = getattr(msg, "response_metadata", None) or {}
+    content = (rm.get("logprobs") or {}).get("content") or []
+
+    per_token: list[float] = []
+    for entry in content:
+        alts = entry.get("top_logprobs") or []
+        logprobs = [a["logprob"] for a in alts if a.get("logprob") is not None]
+        if not logprobs:
+            continue                     # position carried no alternatives; skip it
+        k = len(logprobs)
+        total_p = sum(math.exp(lp) for lp in logprobs)
+        if total_p <= 0.0:
+            continue
+        log_total = math.log(total_p)
+        # (1/k) * sum_j log q_j  where  log q_j = logprob_j - log(sum_p)
+        mean_log_q = sum(logprobs) / k - log_total
+        per_token.append(-math.log(k) - mean_log_q)
+
+    if not per_token:
+        return None
+    return sum(per_token) / len(per_token)
+
+
 async def generate(state: AgentState, config: RunnableConfig) -> dict:
     """Self-consistency sampling. Produce `width` INDEPENDENT samples of the RAW user question:
     HumanMessage(s) only, NO system prompt, NO structured output, plain text. Each sample uses a
@@ -214,15 +268,27 @@ async def generate(state: AgentState, config: RunnableConfig) -> dict:
     width = state["width"]
     llm = get_llm(config)  # plain client; temperature from config (0.0 for low, >0 for wider modes)
 
+    # Logprobs are requested ONLY for the self_certainty_proxy selector, which scores candidates from
+    # them. Other selectors never read them, so their request payloads stay exactly as before and
+    # previously-collected majority/tournament numbers remain reproducible.
+    want_logprobs = config["configurable"].get("rank_mode") == "self_certainty_proxy"
+
     idx = _sample_idx(state, config)
     print(f"\n[IDX {idx}] ==================== Generate Node (Self-Consistency) ====================\n")
     print(f"[IDX {idx}] Question: {state['user_query']}")
     print(f"[IDX {idx}] Width (N samples): {width}")
+    if want_logprobs:
+        print(f"[IDX {idx}] Requesting top_logprobs={GEN_TOP_LOGPROBS} (self-certainty proxy)")
 
     # Raw question ONLY — no SystemMessage, no system prompt, no structured output.
     prompts = [state["messages"] for _ in range(width)]
+
+    def _client(seed: int):
+        c = _seeded(llm, seed)
+        return c.bind(logprobs=True, top_logprobs=GEN_TOP_LOGPROBS) if want_logprobs else c
+
     responses = await asyncio.gather(*[
-        _seeded(llm, random.randint(0, 2**31 - 1)).ainvoke(p) for p in prompts
+        _client(random.randint(0, 2**31 - 1)).ainvoke(p) for p in prompts
     ])
 
     pool = []
@@ -231,8 +297,12 @@ async def generate(state: AgentState, config: RunnableConfig) -> dict:
     )
     for i, r in enumerate(responses):
         content = r.content if isinstance(r.content, str) else str(r.content)
-        pool.append(Candidate(answer=content))
+        confidence = _self_certainty_proxy(r) if want_logprobs else None
+        pool.append(Candidate(answer=content, confidence=confidence))
         print(f"[IDX {idx}] Sample {i}: id={pool[-1].id[:8]}")
+        if want_logprobs:
+            shown = f"{confidence:.4f}" if confidence is not None else "MISSING (server returned no logprobs)"
+            print(f"[IDX {idx}] Sample {i} self-certainty proxy: {shown}")
         # TEMPORARY token-usage debug (one block per generation call)
         _log_token_usage(idx, "Generate Call", msg=r, prompt_text=_gen_prompt_text, completion_text=content)
     print(f"\n[IDX {idx}] ==========================================================================\n")
@@ -321,6 +391,35 @@ async def rank_no_reasoning(
         print(f"[IDX {idx}] [rank_no_reasoning] unparseable response {text!r}; falling back to candidate {labels[0]}")
         label = labels[0]
     return label_to_cand[label], 1, parse_failed
+
+
+# ───────────────────── Self-certainty proxy selector (zero ranking calls) ─────────────────────
+# Baseline for the opposite design point: instead of asking the LLM to compare candidates at all,
+# score each candidate from the confidence signal already produced while it was generated, then take
+# the argmax. Costs ZERO extra LLM calls — that cheapness is the property worth measuring against the
+# tournament's (N-1)/(K-1) ranking calls. Requires `generate` to have run with logprobs enabled.
+
+def select_by_self_certainty(candidates: list["Candidate"], idx: str = "?") -> "Candidate":
+    """Pick the candidate with the highest self-certainty proxy. NO LLM call.
+
+    RAISES RuntimeError when any candidate lacks a score — that means the server returned no
+    logprobs, and silently ranking on partial/absent data would produce numbers that look like a
+    valid experiment but measure nothing. Failing loudly here surfaces the misconfiguration on the
+    first sample instead of after a full benchmark run."""
+    missing = [c.id[:8] for c in candidates if c.confidence is None]
+    if missing:
+        raise RuntimeError(
+            "self_certainty_proxy selected but no logprobs came back for candidate(s) "
+            f"{missing}. Check that llama-server supports `logprobs`/`top_logprobs` on "
+            "/v1/chat/completions (needs a recent build) and that it is not stripping them."
+        )
+
+    ranked = sorted(candidates, key=lambda c: c.confidence, reverse=True)
+    for c in ranked:
+        print(f"[IDX {idx}] candidate {c.id[:8]}: certainty={c.confidence:.4f}")
+    winner = ranked[0]
+    print(f"[IDX {idx}] Argmax certainty: {winner.id[:8]} ({winner.confidence:.4f})")
+    return winner
 
 
 # ───────────────────────── Tournament selector (hierarchical bracket ranking) ─────────────────────────
@@ -435,6 +534,76 @@ async def tournament_rank(
     return global_winner, total_calls, parse_failed_any, rounds, max_group_size
 
 
+# ───────────────── Compute-matched USC selector (one-shot ranking, repeated + voted) ─────────────────
+# The control that isolates WHY the tournament wins. A raw one-shot ranker spends 1 call while the
+# tournament spends (N-1)/(K-1); any accuracy gap could therefore be bought by the extra compute
+# rather than earned by the bracket structure. This selector hands the one-shot ranker the SAME call
+# budget the tournament would spend, then majority-votes its winners. If the tournament still wins at
+# equal budget, the structure is doing the work; if it does not, the gain was compute all along.
+#
+# Each repeat re-presents the candidates in a fresh random ORDER (rather than re-sampling the same
+# prompt). Two reasons: at rank_temperature=0 decoding is deterministic, so identical prompts would
+# return identical winners and the vote would be vacuous; and varying order is the strongest use of
+# the extra budget for a one-shot ranker, since averaging over orders is exactly what cancels the
+# position bias one-shot ranking is known to suffer. It also mirrors `tournament_rank`, which shuffles
+# its own bracket seeding — so neither side gets order-luck the other lacks.
+
+def _tournament_call_budget(n: int) -> int:
+    """Ranking calls `tournament_rank` would spend on n candidates. Derived by walking the REAL
+    bracket splitter (`_tournament_groups`) instead of hardcoding ceil((n-1)/2), so the budget cannot
+    drift if MAX_RANK_GROUP or the bye rule ever changes."""
+    calls = 0
+    survivors = list(range(n))
+    while len(survivors) > 1:
+        advancing = []
+        for group in _tournament_groups(survivors):
+            if len(group) > 1:          # a bye (size 1) costs no call
+                calls += 1
+            advancing.append(group[0])
+        survivors = advancing
+    return calls
+
+
+async def rank_compute_matched_usc(
+    user_query: str, candidates: list["Candidate"], llm, idx: str = "?"
+) -> "tuple[Candidate, int, bool, int]":
+    """Run the one-shot ranker `_tournament_call_budget(N)` times over ALL candidates — each time in a
+    freshly shuffled presentation order — then majority-vote the winners.
+
+    Calls run SEQUENTIALLY on purpose: `tournament_rank` awaits its group calls one after another, so
+    running these concurrently would hand this baseline a wall-clock advantage that has nothing to do
+    with the selection method.
+
+    Ties break toward the candidate earliest in the ORIGINAL pool order — deterministic, so a tie
+    never silently injects extra randomness into the result.
+
+    RETURNS: (winner, rank_calls, parse_failed_any, budget)."""
+    budget = _tournament_call_budget(len(candidates))
+    pool_index = {c.id: i for i, c in enumerate(candidates)}
+
+    print(f"[IDX {idx}] Compute-matched budget: {budget} one-shot call(s) for N={len(candidates)}")
+
+    votes: dict[str, int] = {}
+    id_to_cand = {c.id: c for c in candidates}
+    parse_failed_any = False
+
+    for r in range(1, budget + 1):
+        order = list(candidates)
+        random.shuffle(order)           # fresh presentation order -> real variation even at temp 0
+        winner, _, parse_failed = await rank_no_reasoning(user_query, order, llm, idx)
+        parse_failed_any = parse_failed_any or parse_failed
+        votes[winner.id] = votes.get(winner.id, 0) + 1
+        print(f"[IDX {idx}] Repeat {r}/{budget}: winner={winner.id[:8]}")
+
+    # Highest vote count; ties -> earliest in the original pool order.
+    best_id = min(votes, key=lambda cid: (-votes[cid], pool_index[cid]))
+    tally = ", ".join(f"{cid[:8]}={n}" for cid, n in sorted(votes.items(), key=lambda kv: -kv[1]))
+    print(f"[IDX {idx}] Vote tally: {tally}")
+    print(f"[IDX {idx}] Vote winner: {best_id[:8]} ({votes[best_id]}/{budget})")
+
+    return id_to_cand[best_id], budget, parse_failed_any, budget
+
+
 async def tournament_select(state: AgentState, config: RunnableConfig) -> dict:
     """Tournament selector node. Generation already produced `pool`; here we select Top-1 via a
     HIERARCHICAL TOURNAMENT (`tournament_rank`) instead of one N-way ranking call, to avoid the
@@ -489,6 +658,29 @@ async def tournament_select(state: AgentState, config: RunnableConfig) -> dict:
         # Single candidate: nothing to select (no LLM call, no bracket).
         winner = pool[0]
         print(f"[IDX {idx}] Single candidate; no tournament needed.")
+    elif cfg.get("rank_mode") == "self_certainty_proxy":
+        print(f"[IDX {idx}] Selecting by self-certainty proxy over {len(pool)} candidates (0 LLM calls)...")
+        t0 = time.perf_counter()
+        winner = select_by_self_certainty(pool, idx)
+        rank_latency = time.perf_counter() - t0     # local arithmetic only; expected to be ~0
+        rank_calls = 0                              # the whole point: no ranking call at all
+        tournament_rounds = 0
+        tournament_max_group_size = 0
+    elif cfg.get("rank_mode") == "compute_matched_usc":
+        rank_temp = cfg.get("rank_temperature", 0.0)
+        llm = get_llm(config, temperature=rank_temp)
+        print(f"[IDX {idx}] Executing Compute-Matched USC over all {len(pool)} candidates...")
+        if rank_temp == 0.0:
+            print(f"[IDX {idx}] (rank_temperature=0 -> repeats differ by candidate ORDER only)")
+        t0 = time.perf_counter()
+        winner, rank_calls, rank_parse_failed, _budget = await rank_compute_matched_usc(
+            user_query, pool, llm, idx
+        )
+        rank_latency = time.perf_counter() - t0
+        # Single-stage selector like rank_no_reasoning: every call sees all N candidates, so reuse the
+        # same metric semantics (rounds=1, max group = full pool) instead of inventing new fields.
+        tournament_rounds = 1
+        tournament_max_group_size = len(pool)
     elif cfg.get("rank_mode") == "rank_no_reasoning":
         print(f"[IDX {idx}] Executing One-Shot Ranker over all {len(pool)} candidates...")
         rank_temp = cfg.get("rank_temperature", 0.0)
