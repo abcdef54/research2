@@ -113,7 +113,11 @@ async def solve(
             "bypass_governor": True,
             "temperature": temperature,
             "rank_mode": rank_mode,
-            "rank_temperature": rank_temperature
+            "rank_temperature": rank_temperature,
+            # HumanEval has no answer-equality key: two correct programs are almost never identical
+            # strings, so PairJudge's team grouping is undefined here and every candidate stands
+            # alone. Only read by the pairjudge/rrm rank modes.
+            "rm_team_grouping": "none",
         }
     }
 
@@ -221,7 +225,7 @@ if __name__ == "__main__":
     parser.add_argument("--model", default="qwen2.5-3b-q4")
     parser.add_argument("--mode", choices=["baseline", "low", "medium", "high", "extra"], default="low")
     parser.add_argument("--temp", type=float, default=0.0)
-    parser.add_argument("--rank-mode", choices=["majority", "rank_no_reasoning", "tournament_no_reasoning", "self_certainty_proxy", "compute_matched_usc"], default="tournament_no_reasoning")
+    parser.add_argument("--rank-mode", choices=["majority", "rank_no_reasoning", "tournament_no_reasoning", "self_certainty_proxy", "compute_matched_usc", "pairjudge", "rrm"], default="tournament_no_reasoning")
     parser.add_argument("--rank-temp", type=float, default=0.0)
     parser.add_argument("--save-raw", action="store_true")
     parser.add_argument("--samples", type=int, default=20, help="-1 for full 164 HumanEval problems")

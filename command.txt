@@ -1,1 +1,9 @@
 docker run --rm --gpus all -p 18000:8080 -v D:\Work\Code\GithubProjects\LocalMind\src\backend\ai\llms\cpp_models:/models ghcr.io/ggml-org/llama.cpp:server-cuda -m /models/qwen2.5-3b-instruct-q4_k_m.gguf -ngl 99 -c 32784 --parallel 4
+
+(main) root@C.46476543:/workspace$ llama-server --port 18000 --host 0.0.0.0 -m research2/models/qwen2.5-3b-instruct-q4_k_m.gguf -ngl 99 -c 163804 --parallel 32
+
+huggingface-cli download Qwen/Qwen2.5-3B-Instruct-GGUF \
+  qwen2.5-3b-instruct-q4_k_m.gguf \
+  --local-dir workspace/models
+
+llama-server   --host 0.0.0.0   --port 18000   -m research2/models/qwen2.5-3b-instruct-q4_k_m.gguf   -ngl 99   --parallel 64   -c 327680   --flash-attn on   -b 8192   -ub 4096   --metrics

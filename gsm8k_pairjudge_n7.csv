@@ -1,0 +1,26 @@
+idx,question,ground_truth,prediction,correct,oracle_correct,majority_failed,model,mode,temperature,rank_mode,rank_temperature,rank_latency,rank_calls,rank_parse_failed,rank_agreed_with_majority,winner_candidate_id,rank_reasoning,width,tournament_rounds,tournament_rank_calls,tournament_max_group_size,unique_answers,agreement_ratio,vote_entropy,vote_margin,is_unanimous,invalid_samples,latency_sec,sampled_numbers,vote_distribution,sampled_answers,response
+0,Janet’s ducks lay 16 eggs per day. She eats three for breakfast every morning and bakes muffins for her friends every day with four. She sells the remainder at the farmers' market daily for $2 per fresh duck egg. How much in dollars does she make every day at the farmers' market?,18.0,18.0,True,False,False,qwen2.5-3b-q4,extra,0.5,pairjudge,0.0,0.000720500000170432,0,False,True,8437a47829dd4a74bfc2103c4474c78a,,0,0,0,2,0,0.0,0.0,0,False,0,9.309498399999939,[],{},,"To determine how much Janet makes every day at the farmers' market, we need to calculate the number of eggs she has left after her morning consumption and baking, and then find out how much she earns from selling the remainder.
+
+1. **Total eggs laid per day**: Janet's ducks lay 16 eggs per day.
+2. **Eggs eaten for breakfast**: Janet eats 3 eggs for breakfast each day.
+3. **Eggs used for baking**: Janet uses 4 eggs for baking muffins each day.
+
+First, we calculate the total number of eggs used:
+\[
+3 \text{ (for breakfast)} + 4 \text{ (for baking)} = 7 \text{ eggs}
+\]
+
+Next, we subtract the total number of eggs used from the total number of eggs laid to find the number of eggs left:
+\[
+16 \text{ (total eggs)} - 7 \text{ (used eggs)} = 9 \text{ eggs}
+\]
+
+Janet sells the remaining eggs at the farmers' market for $2 per egg. Therefore, the amount she makes each day is:
+\[
+9 \text{ (eggs)} \times 2 \text{ (dollars per egg)} = 18 \text{ dollars}
+\]
+
+Thus, the final amount Janet makes every day at the farmers' market is:
+\[
+\boxed{18}
+\]"

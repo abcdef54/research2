@@ -681,6 +681,22 @@ async def tournament_select(state: AgentState, config: RunnableConfig) -> dict:
         # same metric semantics (rounds=1, max group = full pool) instead of inventing new fields.
         tournament_rounds = 1
         tournament_max_group_size = len(pool)
+    elif cfg.get("rank_mode") in ("pairjudge", "rrm"):
+        # External reward-model judge (PairJudge RM / RRM). These are HuggingFace checkpoints, not the
+        # llama-server client, so this path never touches get_llm(). Imported here rather than at
+        # module scope so runs that don't use them need no torch/transformers install.
+        from rm_judges import rm_knockout
+        kind = cfg["rank_mode"]
+        # "numeric" reproduces PairJudge's answer-equality teams (valid on GSM8K); "none" gives every
+        # candidate its own team, which is what HumanEval requires — see rm_judges' module docstring.
+        grouping = cfg.get("rm_team_grouping", "none")
+        print(f"[IDX {idx}] Executing {kind} knockout over {len(pool)} candidates...")
+        t0 = time.perf_counter()
+        winner, rank_calls, rank_parse_failed, tournament_rounds = await rm_knockout(
+            user_query, pool, kind, grouping, idx, sample_tag=str(cfg.get("sample_idx", "")),
+        )
+        rank_latency = time.perf_counter() - t0
+        tournament_max_group_size = 2               # pairwise by construction: K=2 for both judges
     elif cfg.get("rank_mode") == "rank_no_reasoning":
         print(f"[IDX {idx}] Executing One-Shot Ranker over all {len(pool)} candidates...")
         rank_temp = cfg.get("rank_temperature", 0.0)

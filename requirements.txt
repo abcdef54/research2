@@ -2,7 +2,7 @@ tqdm
 fire
 numpy
 
-
+torch --index-url https://download.pytorch.org/whl/cu126
 python-dotenv
 pydantic
 langchain-core
@@ -10,3 +10,5 @@ langchain-openai
 langgraph
 datasets
 huggingface_hub
+transformers
+accelerate
