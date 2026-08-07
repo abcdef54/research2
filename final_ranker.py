@@ -19,10 +19,18 @@ from langgraph.graph.message import add_messages
 
 dotenv.load_dotenv()
 
-# Max candidates compared in a single tournament ranking call. One-shot ranking degrades as the
-# candidate count grows and N=3 is the ranker's sweet spot, so each tournament round ranks groups
-# of 3 and byes the remainder (minimum rank calls).
+# DEFAULT max candidates compared in a single tournament ranking call — the group size K. One-shot
+# ranking degrades as the candidate count grows and K=3 has been the ranker's sweet spot, so by
+# default each tournament round ranks groups of 3 and byes the remainder (minimum rank calls).
+# This is only the FALLBACK. The effective K is read per run from
+# config["configurable"]["max_rank_group"] (harness flag --max-group), so sweeping K for the
+# ablation needs no code edit and every other selector is left untouched.
 MAX_RANK_GROUP = 3
+
+# Smallest legal K. At K=1 every group is a singleton, i.e. a bye, so no candidate is ever
+# eliminated and `while len(survivors) > 1` in `tournament_rank` never exits. Rejected up front
+# (see `_resolve_max_group`) instead of hanging a multi-hour benchmark run.
+MIN_RANK_GROUP = 2
 
 # How many per-token alternatives to request from the server during GENERATION, used only by the
 # `self_certainty_proxy` selector. 20 is the OpenAI-compatible API's documented ceiling for
@@ -426,24 +434,54 @@ def select_by_self_certainty(candidates: list["Candidate"], idx: str = "?") -> "
 # Pure ORCHESTRATION over the one-shot plain-text ranker (rank_no_reasoning): NO new prompt, NO
 # regeneration, NO verifier/critic, NO abstention, NO extra generation round — the generator above is
 # untouched and ONLY the selector changes. Rather than one N-way ranking call, run a balanced tournament
-# where every ranking call compares at most MAX_RANK_GROUP (=3) candidates.
+# where every ranking call compares at most K candidates (K = `max_group`, default MAX_RANK_GROUP).
 
-def _tournament_groups(candidates: list["Candidate"]) -> list[list["Candidate"]]:
-    """One round's bracket split — the MINIMUM-rank-call rule. Rank floor(n/3) full
-    groups of MAX_RANK_GROUP (=3); the trailing n%3 candidates each take a BYE (a size-1 group, no
-    ranking call) rather than being ranked as a sub-3 group. A group of 3 removes 2 candidates per
-    call, so this hits the theoretical minimum ceil((n-1)/2) calls for every n. Byeing the remainder
-    (instead of ranking it) is what lets the survivor count drop straight to <=3 and finish in one
-    final call — e.g. N=5: rank one [3], bye the other two -> 3 survivors -> 1 final call = 2 calls
-    (NOT [3,2] -> 3 calls). Structures: 3 -> [3] (1 call); 5 -> [3] + 2 byes (2 calls); 7 -> [3,3]
-    + 1 bye (3 calls); 9 -> [3,3,3] (4 calls); all reach exactly 3 survivors after round 1, then a
-    single 3-way final. The list is already shuffled by `tournament_rank`, so which candidates fill
-    the ranked groups vs. take byes is random; the A/B/C… labels are display-only (input order)."""
+def _resolve_max_group(cfg: dict) -> int:
+    """Effective tournament group size K for this run: the config value if the harness supplied one
+    (--max-group), otherwise MAX_RANK_GROUP.
+
+    Validated ONCE at the top of the selector rather than inside the bracket loop, because the
+    failure mode is a hang, not an exception: at K=1 every group is a bye, nobody is eliminated, and
+    `tournament_rank` spins forever. A benchmark that hangs on sample 1 of 1319 looks like a slow
+    GPU, not a bad flag, so this raises loudly instead."""
+    raw = cfg.get("max_rank_group", MAX_RANK_GROUP)
+    if raw is None:
+        return MAX_RANK_GROUP
+    try:
+        k = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"max_rank_group must be an integer >= {MIN_RANK_GROUP}, got {raw!r}"
+        )
+    if k < MIN_RANK_GROUP:
+        raise ValueError(
+            f"max_rank_group must be >= {MIN_RANK_GROUP}, got {k}. K=1 byes every group, so no "
+            "candidate is ever eliminated and the tournament would never terminate."
+        )
+    return k
+
+
+def _tournament_groups(
+    candidates: list["Candidate"],
+    max_group: int = MAX_RANK_GROUP,
+) -> list[list["Candidate"]]:
+    """One round's bracket split — the MINIMUM-rank-call rule, for any group size K = `max_group`.
+    Rank floor(n/K) full groups of K; the trailing n%K candidates each take a BYE (a size-1 group,
+    no ranking call) rather than being ranked as a sub-K group. A group of K removes K-1 candidates
+    per call, so this hits the theoretical minimum ceil((n-1)/(K-1)) calls for every n and every
+    K >= 2 (verified for K=2..5, n=3..16). Byeing the remainder (instead of ranking it) is what lets
+    the survivor count drop straight to <=K and finish in one final call — e.g. K=3, N=5: rank one
+    [3], bye the other two -> 3 survivors -> 1 final call = 2 calls (NOT [3,2] -> 3 calls).
+    Structures at K=3: 3 -> [3] (1 call); 5 -> [3] + 2 byes (2 calls); 7 -> [3,3] + 1 bye (3 calls);
+    9 -> [3,3,3] (4 calls). At N=7 the ablation costs 6 calls (K=2), 3 (K=3), 2 (K=4) — so K also
+    trades rank compute, not just per-call difficulty. The list is already shuffled by
+    `tournament_rank`, so which candidates fill the ranked groups vs. take byes is random; the
+    A/B/C… labels are display-only (input order)."""
     n = len(candidates)
-    if n <= MAX_RANK_GROUP:
+    if n <= max_group:
         return [list(candidates)]                         # final group, ranked in one call
-    full = (n // MAX_RANK_GROUP) * MAX_RANK_GROUP          # candidates that fill complete size-3 groups
-    groups = [list(candidates[i:i + MAX_RANK_GROUP]) for i in range(0, full, MAX_RANK_GROUP)]
+    full = (n // max_group) * max_group                    # candidates that fill complete size-K groups
+    groups = [list(candidates[i:i + max_group]) for i in range(0, full, max_group)]
     groups.extend([candidates[j]] for j in range(full, n))  # trailing remainder -> singleton byes
     return groups
 
@@ -453,12 +491,13 @@ async def tournament_rank(
     candidates: list["Candidate"],
     llm,
     idx: str = "?",
+    max_group: int = MAX_RANK_GROUP,
 ) -> "tuple[Candidate, int, bool, int, int]":
     """Hierarchical tournament selector — an ORCHESTRATION layer over the existing one-shot ranker;
-    it does NOT introduce a new ranking prompt. Each ranking call sees at most MAX_RANK_GROUP
+    it does NOT introduce a new ranking prompt. Each ranking call sees at most K = `max_group`
     candidates, decomposing the N-way comparison that degrades at larger N.
-    Algorithm: shuffle once -> `_tournament_groups` ranks floor(n/3) groups of 3 and byes the
-    trailing n%3 (minimum rank calls) -> rank each group with the one-shot plain-text ranker ->
+    Algorithm: shuffle once -> `_tournament_groups` ranks floor(n/K) groups of K and byes the
+    trailing n%K (minimum rank calls) -> rank each group with the one-shot plain-text ranker ->
     advance winners (a byed singleton carries over with no call) -> recurse until one candidate remains.
 
     RETURNS: (global_winner, total_rank_calls, parse_failed, tournament_rounds,
@@ -487,6 +526,7 @@ async def tournament_rank(
     random.shuffle(survivors)   # randomize bracket seeding only; identity labels already fixed above
 
     print(f"\n[IDX {idx}] ================ Tournament Ranking ================\n")
+    print(f"[IDX {idx}] Max group size K: {max_group}")
 
     total_calls = 0
     rounds = 0
@@ -495,13 +535,13 @@ async def tournament_rank(
 
     while len(survivors) > 1:
         rounds += 1
-        groups = _tournament_groups(survivors)
+        groups = _tournament_groups(survivors, max_group)
         print(f"[IDX {idx}] Round {rounds}")
         next_survivors: list[Candidate] = []
         for gi, group in enumerate(groups, start=1):
             if len(group) == 1:
-                # Bye: a lone candidate advances with no ranking call. Under 3B's min-call grouping
-                # this is the EXPECTED handling of the trailing n%3 (e.g. N=5 byes 2 -> 3 survivors;
+                # Bye: a lone candidate advances with no ranking call. Under the min-call grouping
+                # this is the EXPECTED handling of the trailing n%K (at K=3: N=5 byes 2 -> 3 survivors;
                 # N=7 byes 1 -> 3 survivors; N=9 byes none), which is what keeps the call count minimal.
                 print(f"[IDX {idx}] Group {gi}: {lbl(group[0])} (bye)")
                 print(f"[IDX {idx}] Winner: {lbl(group[0])}\n")
@@ -512,7 +552,7 @@ async def tournament_rank(
             print(f"[IDX {idx}] Group {gi}:")
             if len(group) == 2:
                 print(f"[IDX {idx}] {lbl(group[0])} vs {lbl(group[1])}")
-            else:                                   # 3-way (MAX_RANK_GROUP); list vertically
+            else:                                   # 3-or-more-way group; list vertically
                 for c in group:
                     print(f"[IDX {idx}] {lbl(c)}")
 
@@ -548,15 +588,20 @@ async def tournament_rank(
 # position bias one-shot ranking is known to suffer. It also mirrors `tournament_rank`, which shuffles
 # its own bracket seeding — so neither side gets order-luck the other lacks.
 
-def _tournament_call_budget(n: int) -> int:
-    """Ranking calls `tournament_rank` would spend on n candidates. Derived by walking the REAL
-    bracket splitter (`_tournament_groups`) instead of hardcoding ceil((n-1)/2), so the budget cannot
-    drift if MAX_RANK_GROUP or the bye rule ever changes."""
+def _tournament_call_budget(n: int, max_group: int = MAX_RANK_GROUP) -> int:
+    """Ranking calls `tournament_rank` would spend on n candidates at group size K = `max_group`.
+    Derived by walking the REAL bracket splitter (`_tournament_groups`) instead of hardcoding
+    ceil((n-1)/(K-1)), so the budget cannot drift if K or the bye rule ever changes.
+
+    K MUST be threaded in here, not left at the default: the whole point of this control is to hand
+    the one-shot ranker the tournament's exact call budget. At N=7 that budget is 6 calls at K=2 but
+    only 2 at K=4, so a K-ablation run that computed the budget at a stale K=3 would silently stop
+    being compute-matched and the comparison would measure nothing."""
     calls = 0
     survivors = list(range(n))
     while len(survivors) > 1:
         advancing = []
-        for group in _tournament_groups(survivors):
+        for group in _tournament_groups(survivors, max_group):
             if len(group) > 1:          # a bye (size 1) costs no call
                 calls += 1
             advancing.append(group[0])
@@ -565,10 +610,11 @@ def _tournament_call_budget(n: int) -> int:
 
 
 async def rank_compute_matched_usc(
-    user_query: str, candidates: list["Candidate"], llm, idx: str = "?"
+    user_query: str, candidates: list["Candidate"], llm, idx: str = "?",
+    max_group: int = MAX_RANK_GROUP,
 ) -> "tuple[Candidate, int, bool, int]":
-    """Run the one-shot ranker `_tournament_call_budget(N)` times over ALL candidates — each time in a
-    freshly shuffled presentation order — then majority-vote the winners.
+    """Run the one-shot ranker `_tournament_call_budget(N, K)` times over ALL candidates — each time
+    in a freshly shuffled presentation order — then majority-vote the winners.
 
     Calls run SEQUENTIALLY on purpose: `tournament_rank` awaits its group calls one after another, so
     running these concurrently would hand this baseline a wall-clock advantage that has nothing to do
@@ -578,10 +624,13 @@ async def rank_compute_matched_usc(
     never silently injects extra randomness into the result.
 
     RETURNS: (winner, rank_calls, parse_failed_any, budget)."""
-    budget = _tournament_call_budget(len(candidates))
+    budget = _tournament_call_budget(len(candidates), max_group)
     pool_index = {c.id: i for i, c in enumerate(candidates)}
 
-    print(f"[IDX {idx}] Compute-matched budget: {budget} one-shot call(s) for N={len(candidates)}")
+    print(
+        f"[IDX {idx}] Compute-matched budget: {budget} one-shot call(s) "
+        f"for N={len(candidates)}, K={max_group}"
+    )
 
     votes: dict[str, int] = {}
     id_to_cand = {c.id: c for c in candidates}
@@ -618,6 +667,7 @@ async def tournament_select(state: AgentState, config: RunnableConfig) -> dict:
     pool = state.get("pool", [])
     user_query = state.get("user_query", "")
     idx = _sample_idx(state, config)
+    max_group = _resolve_max_group(cfg)   # K for this run; raises on K < 2 rather than hanging
 
     sampled_answers = [
         c.answer
@@ -626,6 +676,7 @@ async def tournament_select(state: AgentState, config: RunnableConfig) -> dict:
 
     print(f"\n[IDX {idx}] ============ Tournament-Select Node ============\n")
     print(f"[IDX {idx}] Rank mode: Tournament")
+    print(f"[IDX {idx}] Max group size K: {max_group}")
     print(f"[IDX {idx}] Candidates: {len(pool)}")
     for label, candidate in zip(_candidate_labels(len(pool)), pool):
         print(f"[IDX {idx}] {label}: id={candidate.id[:8]}")
@@ -674,7 +725,7 @@ async def tournament_select(state: AgentState, config: RunnableConfig) -> dict:
             print(f"[IDX {idx}] (rank_temperature=0 -> repeats differ by candidate ORDER only)")
         t0 = time.perf_counter()
         winner, rank_calls, rank_parse_failed, _budget = await rank_compute_matched_usc(
-            user_query, pool, llm, idx
+            user_query, pool, llm, idx, max_group
         )
         rank_latency = time.perf_counter() - t0
         # Single-stage selector like rank_no_reasoning: every call sees all N candidates, so reuse the
@@ -696,7 +747,9 @@ async def tournament_select(state: AgentState, config: RunnableConfig) -> dict:
             user_query, pool, kind, grouping, idx, sample_tag=str(cfg.get("sample_idx", "")),
         )
         rank_latency = time.perf_counter() - t0
-        tournament_max_group_size = 2               # pairwise by construction: K=2 for both judges
+        # Pairwise by construction for both judges (their published algorithms are K=2 knockouts),
+        # so --max-group does NOT apply here and is deliberately not passed through.
+        tournament_max_group_size = 2
     elif cfg.get("rank_mode") == "rank_no_reasoning":
         print(f"[IDX {idx}] Executing One-Shot Ranker over all {len(pool)} candidates...")
         rank_temp = cfg.get("rank_temperature", 0.0)
@@ -714,7 +767,7 @@ async def tournament_select(state: AgentState, config: RunnableConfig) -> dict:
         t0 = time.perf_counter()
         (winner, rank_calls, rank_parse_failed,
          tournament_rounds, tournament_max_group_size) = await tournament_rank(
-            user_query, pool, llm, idx
+            user_query, pool, llm, idx, max_group
         )
         rank_latency = time.perf_counter() - t0
 

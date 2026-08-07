@@ -90,7 +90,8 @@ async def solve(
     reasoning_mode: str,
     temperature: float,
     rank_mode: str,
-    rank_temperature: float
+    rank_temperature: float,
+    max_group: int
 ):
     config = {
         "configurable": {
@@ -102,6 +103,9 @@ async def solve(
             "temperature": temperature,
             "rank_mode": rank_mode,
             "rank_temperature": rank_temperature,
+            # Tournament group size K (--max-group). Read by the tournament and compute_matched_usc
+            # selectors only; the pairjudge/rrm judges are pairwise by construction and ignore it.
+            "max_rank_group": max_group,
             # GSM8K answers are single numbers, so PairJudge's real team rule applies: candidates
             # sharing a final answer form one team, never fight each other, and end the bracket early.
             # Only read by the pairjudge/rrm rank modes (rrm ignores it — it has no team concept).
@@ -157,7 +161,8 @@ async def evaluate_sample(
     temperature,
     rank_mode,
     rank_temperature,
-    save_raw
+    save_raw,
+    max_group
 ):
     q = sample["question"]
     gt = extract_gsm8k_label(
@@ -175,7 +180,8 @@ async def evaluate_sample(
                 reasoning_mode,
                 temperature,
                 rank_mode,
-                rank_temperature
+                rank_temperature,
+                max_group
             )
 
         latency = (
@@ -435,7 +441,8 @@ async def evaluate(
     rank_mode,
     rank_temperature,
     csv_path,
-    save_raw
+    save_raw,
+    max_group
 ):
     tasks = [
         evaluate_sample(
@@ -446,7 +453,8 @@ async def evaluate(
             temperature,
             rank_mode,
             rank_temperature,
-            save_raw
+            save_raw,
+            max_group
         )
         for i, sample
         in enumerate(dataset)
@@ -891,6 +899,17 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--max-group",
+        type=int,
+        default=3,
+        help=(
+            "Tournament group size K: at most K candidates per ranking call. Must be >= 2 "
+            "(K=1 never eliminates anyone and would never terminate). Affects the tournament "
+            "and compute_matched_usc rank modes only."
+        ),
+    )
+
+    parser.add_argument(
         "--save-raw",
         action="store_true",
     )
@@ -931,6 +950,8 @@ if __name__ == "__main__":
             )
         )
 
+    # Default filename carries K so a K sweep cannot silently overwrite its own earlier runs.
+    # An explicit --out is respected verbatim, exactly as before.
     csv_path = (
         args.out
         or
@@ -938,6 +959,7 @@ if __name__ == "__main__":
         f"{args.model}_"
         f"{args.mode}_"
         f"t{args.temp}_"
+        f"k{args.max_group}_"
         f"n{len(dataset)}.csv"
     )
 
@@ -950,6 +972,7 @@ if __name__ == "__main__":
             csv_path=csv_path,
             rank_mode=args.rank_mode,
             rank_temperature=args.rank_temp,
-            save_raw=args.save_raw
+            save_raw=args.save_raw,
+            max_group=args.max_group
         )
     )

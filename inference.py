@@ -102,7 +102,8 @@ async def solve(
     reasoning_mode: str,
     temperature: float,
     rank_mode: str,
-    rank_temperature: float
+    rank_temperature: float,
+    max_group: int
 ):
     config = {
         "configurable": {
@@ -114,6 +115,9 @@ async def solve(
             "temperature": temperature,
             "rank_mode": rank_mode,
             "rank_temperature": rank_temperature,
+            # Tournament group size K (--max-group). Read by the tournament and compute_matched_usc
+            # selectors only; the pairjudge/rrm judges are pairwise by construction and ignore it.
+            "max_rank_group": max_group,
             # HumanEval has no answer-equality key: two correct programs are almost never identical
             # strings, so PairJudge's team grouping is undefined here and every candidate stands
             # alone. Only read by the pairjudge/rrm rank modes.
@@ -152,7 +156,8 @@ async def evaluate_sample(
     reasoning_mode,
     temperature,
     rank_mode,
-    rank_temperature
+    rank_temperature,
+    max_group
 ):
     prompt = sample["prompt"]
     task_id = sample["task_id"]
@@ -165,7 +170,8 @@ async def evaluate_sample(
                 reasoning_mode,
                 temperature,
                 rank_mode,
-                rank_temperature
+                rank_temperature,
+                max_group
             )
 
         pred_text = state.get("final_answer", "")
@@ -184,10 +190,13 @@ async def evaluate_sample(
 
 
 async def evaluate(
-    dataset, model_name, reasoning_mode, temperature, rank_mode, rank_temperature, jsonl_path
+    dataset, model_name, reasoning_mode, temperature, rank_mode, rank_temperature, jsonl_path,
+    max_group
 ):
     tasks = [
-        evaluate_sample(sample, model_name, reasoning_mode, temperature, rank_mode, rank_temperature)
+        evaluate_sample(
+            sample, model_name, reasoning_mode, temperature, rank_mode, rank_temperature, max_group
+        )
         for sample in dataset
     ]
 
@@ -227,6 +236,14 @@ if __name__ == "__main__":
     parser.add_argument("--temp", type=float, default=0.0)
     parser.add_argument("--rank-mode", choices=["majority", "rank_no_reasoning", "tournament_no_reasoning", "self_certainty_proxy", "compute_matched_usc", "pairjudge", "rrm"], default="tournament_no_reasoning")
     parser.add_argument("--rank-temp", type=float, default=0.0)
+    parser.add_argument(
+        "--max-group",
+        type=int,
+        default=3,
+        help="Tournament group size K: at most K candidates per ranking call. Must be >= 2 "
+             "(K=1 never eliminates anyone and would never terminate). Affects the tournament "
+             "and compute_matched_usc rank modes only.",
+    )
     parser.add_argument("--save-raw", action="store_true")
     parser.add_argument("--samples", type=int, default=20, help="-1 for full 164 HumanEval problems")
     parser.add_argument("--sem", type=int, default=2)
@@ -249,7 +266,10 @@ if __name__ == "__main__":
         if jsonl_path.endswith(".csv"):
             jsonl_path = jsonl_path[:-4] + ".jsonl"
     else:
-        jsonl_path = f"humaneval_{args.model}_{args.mode}_t{args.temp}_n{len(dataset)}.jsonl"
+        jsonl_path = (
+            f"humaneval_{args.model}_{args.mode}_t{args.temp}"
+            f"_k{args.max_group}_n{len(dataset)}.jsonl"
+        )
 
     asyncio.run(
         evaluate(
@@ -259,6 +279,7 @@ if __name__ == "__main__":
             temperature=args.temp,
             jsonl_path=jsonl_path,
             rank_mode=args.rank_mode,
-            rank_temperature=args.rank_temp
+            rank_temperature=args.rank_temp,
+            max_group=args.max_group
         )
     )
